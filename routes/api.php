@@ -14,5 +14,7 @@ Route::middleware(['cors'])->group(function () {
     Route::post('/payment/initiate', [PaymentController::class, 'initiate']);
     Route::post('/payment/callback', [PaymentController::class, 'callback']);
     Route::get('/payment/status', [PaymentController::class, 'checkStatus']);
+    Route::get('/payment/balance', [PaymentController::class, 'getBalance']);
     Route::post('/payment/cancel', [PaymentController::class, 'cancel']);
+    Route::post('/payment/payout', [PaymentController::class, 'payout']);
 });

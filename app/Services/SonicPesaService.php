@@ -13,7 +13,6 @@ class SonicPesaService
     private $secret;
     private $baseUrl;
     private $enabled;
-    private $token;
 
     public function __construct()
     {
@@ -26,11 +25,6 @@ class SonicPesaService
 
     /**
      * Initiate Mobile Money Payment (USSD Push)
-     * 
-     * @param string $phoneNumber Phone number (e.g., 255712345678)
-     * @param float $amount Payment amount
-     * @param string $orderReference Unique order reference
-     * @return array Response from SonicPesa
      */
     public function initiatePayment($phoneNumber, $amount, $orderReference)
     {
@@ -47,63 +41,54 @@ class SonicPesaService
         }
 
         try {
-            // Clean phone number (remove + and spaces)
             $cleanPhone = preg_replace('/[^0-9]/', '', $phoneNumber);
-            
-            // SonicPesa likely expects 255 standard format
             if (str_starts_with($cleanPhone, '0')) {
                 $cleanPhone = '255' . substr($cleanPhone, 1);
             }
 
-            // Determine mobile provider based on prefix (Optional but helpful for logging)
-            $provider = $this->getProviderFromPhone($cleanPhone);
-
             $payload = [
-                'buyer_email' => 'customer@haset.app', // Placeholder
-                'buyer_name' => 'HASET Patient',      // Placeholder
+                'buyer_email' => 'customer@haset.app',
+                'buyer_name' => 'HASET Patient',
                 'buyer_phone' => $cleanPhone,
                 'amount' => $amount,
                 'currency' => 'TZS',
-                'external_reference' => $orderReference // Often good to send this
+                'external_reference' => $orderReference
             ];
 
-            Log::info('Initiating SonicPesa payment', [
-                'orderReference' => $orderReference,
-                'endpoint' => $this->baseUrl . '/payment/create_order',
-                'payload' => $payload
-            ]);
+            Log::info('Initiating SonicPesa payment', ['orderReference' => $orderReference]);
 
             $response = Http::withHeaders([
                 'X-API-KEY' => $this->apiKey,
-                'X-API-SECRET' => $this->secret,
                 'Content-Type' => 'application/json',
-                'Accept' => 'application/json'
-            ])->post($this->baseUrl . '/payment/create_order', $payload);
+                'Accept' => 'application/json',
+                'User-Agent' => 'HASET-Payment/1.0'
+            ])
+            ->timeout(30)
+            ->post($this->baseUrl . '/payment/create_order', $payload);
 
             if ($response->successful()) {
                 $data = $response->json();
-                Log::info('SonicPesa payment initiated successfully', ['response' => $data]);
+                $orderId = $data['data']['order_id'] ?? $orderReference;
                 
                 return [
                     'success' => true,
                     'data' => [
-                        'id' => $data['transaction_id'] ?? $orderReference,
-                        'status' => 'pending', 
-                        'channel' => $provider
+                        'id' => $orderId,
+                        'reference' => $data['data']['reference'] ?? null,
+                        'status' => $data['data']['status'] ?? 'PENDING',
+                        'channel' => $data['data']['channel'] ?? 'Mobile'
                     ]
                 ];
             }
 
-            // DETAILED ERROR LOGGING
             Log::error('SonicPesa payment initiation failed', [
                 'status' => $response->status(),
-                'body' => $response->body(), // This is critical to see the API error message
-                'payload' => $payload
+                'body' => $response->body()
             ]);
 
             return [
                 'success' => false,
-                'error' => $response->json()['message'] ?? 'Payment initiation failed: ' . $response->body(),
+                'error' => $response->json()['message'] ?? 'Payment initiation failed',
                 'status' => $response->status()
             ];
 
@@ -111,53 +96,45 @@ class SonicPesaService
             Log::error('SonicPesa payment error: ' . $e->getMessage());
             return [
                 'success' => false,
-                'error' => $e->getMessage()
+                'error' => 'Payment gateway error'
             ];
         }
     }
 
     /**
      * Check payment status
-     * 
-     * @param string $transactionId Transaction ID to check
-     * @return array Payment status
      */
     public function checkPaymentStatus($transactionId)
     {
         if (!$this->enabled) {
             return [
                 'success' => true,
-                'data' => [
-                    'status' => 'SUCCESS',
-                    'raw_response' => ['payment_status' => 'success', 'message' => 'Simulated success']
-                ]
+                'data' => ['status' => 'SUCCESS']
             ];
         }
 
         try {
-            // Using endpoint /payment/query/{transaction_id} as a standard guess for similar APIs or keep generic
-            // Assuming the check status endpoint follows similar patterns
             $response = Http::withHeaders([
                 'X-API-KEY' => $this->apiKey,
-                'X-API-SECRET' => $this->secret,
                 'Content-Type' => 'application/json',
                 'Accept' => 'application/json'
-            ])->get($this->baseUrl . '/payment/query', [ // Changed from check_transaction_status to payment/query which is common
-                'transaction_id' => $transactionId
+            ])
+            ->timeout(10)
+            ->post($this->baseUrl . '/payment/order_status', [
+                'order_id' => $transactionId
             ]);
 
             if ($response->successful()) {
                 $data = $response->json();
+                $rawStatus = strtolower($data['data']['payment_status'] ?? 'pending');
+                $status = 'PENDING';
                 
-                // Map SonicPesa status format to Standard format
-                // Example check: $data['payment_status'] might be "success", "failed", "pending"
-                $rawStatus = strtolower($data['payment_status'] ?? 'pending');
-                $status = 'PROCESSING';
-                
-                if ($rawStatus === 'success' || $rawStatus === 'completed') {
-                    $status = 'SUCCESS';
-                } elseif ($rawStatus === 'failed' || $rawStatus === 'cancelled') {
-                    $status = 'FAILED';
+                if ($rawStatus === 'completed') {
+                    $status = 'COMPLETED';
+                } elseif (in_array($rawStatus, ['cancelled', 'usercancelled', 'rejected'])) {
+                    $status = 'CANCELLED';
+                } elseif ($rawStatus === 'inprogress') {
+                    $status = 'INPROGRESS';
                 }
 
                 return [
@@ -169,50 +146,130 @@ class SonicPesaService
                 ];
             }
 
-            return [
-                'success' => false,
-                'error' => 'Failed to check payment status'
-            ];
+            return ['success' => false, 'error' => 'Failed to check status'];
 
         } catch (Exception $e) {
             Log::error('SonicPesa status check error: ' . $e->getMessage());
-            return [
-                'success' => false,
-                'error' => $e->getMessage()
-            ];
+            return ['success' => false, 'error' => 'Network error'];
         }
     }
 
     /**
-     * Helper to determine provider from phone prefix
+     * Disburse Funds (Payout)
      */
+    public function payout($phoneNumber, $amount, $orderReference)
+    {
+        if (!$this->enabled) {
+            Log::info('SonicPesa Payout disabled, simulating success');
+            return [
+                'success' => true,
+                'simulated' => true,
+                'data' => [
+                    'status' => 'SUCCESS',
+                    'message' => 'Simulated payout success'
+                ]
+            ];
+        }
+
+        try {
+            $cleanPhone = preg_replace('/[^0-9]/', '', $phoneNumber);
+            if (str_starts_with($cleanPhone, '0')) {
+                $cleanPhone = '255' . substr($cleanPhone, 1);
+            }
+
+            $payload = [
+                'recipient_phone' => $cleanPhone,
+                'amount' => $amount,
+                'currency' => 'TZS',
+                'external_reference' => $orderReference,
+                'remarks' => 'Doctor Withdrawal via HASET App'
+            ];
+
+            Log::info('Initiating SonicPesa payout attempt', ['payload' => $payload]);
+
+            $response = Http::withHeaders([
+                'X-API-KEY' => $this->apiKey,
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json'
+            ])
+            ->timeout(30)
+            ->post($this->baseUrl . '/payment/payout', $payload);
+
+            if ($response->successful()) {
+                return ['success' => true, 'data' => $response->json()];
+            }
+
+            Log::error('SonicPesa payout failed', ['status' => $response->status(), 'body' => $response->body()]);
+            return ['success' => false, 'error' => 'Payout failed at gateway'];
+
+        } catch (Exception $e) {
+            Log::error('SonicPesa payout exception: ' . $e->getMessage());
+            return ['success' => false, 'error' => 'Network error during payout'];
+        }
+    }
+
+    /**
+     * Get Account Balance (Platform/Gateway Balance)
+     */
+    public function getAccountBalance()
+    {
+        if (!$this->enabled) {
+            return [
+                'success' => true,
+                'simulated' => true,
+                'data' => [
+                    'balance' => 4550200.0,
+                    'currency' => 'TZS'
+                ]
+            ];
+        }
+
+        try {
+            Log::info('Checking SonicPesa account balance');
+
+            $response = Http::withHeaders([
+                'X-API-KEY' => $this->apiKey,
+                'Accept' => 'application/json'
+            ])
+            ->timeout(10)
+            ->get($this->baseUrl . '/payment/balance');
+
+            if ($response->successful()) {
+                $data = $response->json();
+                return [
+                    'success' => true,
+                    'data' => [
+                        'balance' => floatval($data['data']['balance'] ?? 0.0),
+                        'currency' => $data['data']['currency'] ?? 'TZS'
+                    ]
+                ];
+            }
+
+            $errorBody = $response->json();
+            Log::error('SonicPesa balance check failed', [
+                'status' => $response->status(),
+                'body' => $response->body()
+            ]);
+
+            return [
+                'success' => false,
+                'error' => $errorBody['message'] ?? 'Gateway Error: ' . $response->status()
+            ];
+
+        } catch (Exception $e) {
+            Log::error('SonicPesa balance exception: ' . $e->getMessage());
+            return ['success' => false, 'error' => 'Network error during balance check'];
+        }
+    }
+
     private function getProviderFromPhone($phone)
     {
         $prefix = substr($phone, 0, 3);
-        $prefix2 = substr($phone, 0, 2);
-        
         if (in_array($prefix, ['071', '065', '067'])) return 'Tigo';
         if (in_array($prefix, ['075', '076', '074'])) return 'Vodacom';
         if (in_array($prefix, ['078', '068', '069'])) return 'Airtel';
         if (in_array($prefix, ['062'])) return 'Halotel';
         if (in_array($prefix, ['073'])) return 'TTCL';
-        
-    }
-
-    /**
-     * Helper to map provider name to Channel ID (if required by SonicPesa)
-     */
-    private function getChannelId($provider)
-    {
-        // This mapping depends on SonicPesa's specific Channel IDs.
-        // For now returning generic IDs or null if not strictly required
-        return match($provider) {
-            'Vodacom' => 'M-Pesa',
-            'Tigo' => 'TigoPesa',
-            'Airtel' => 'AirtelMoney',
-            'Halotel' => 'HaloPesa',
-            'TTCL' => 'T-Pesa',
-            default => 'Mobile'
-        };
+        return 'Mobile';
     }
 }

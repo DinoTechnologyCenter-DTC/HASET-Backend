@@ -43,4 +43,8 @@ return [
         'base_url' => env('SONICPESA_BASE_URL', 'https://api.sonicpesa.com/api/v1'),
     ],
 
+    'admin' => [
+        'payout_password' => env('ADMIN_PAYOUT_PASSWORD', 'admin123'),
+    ],
+
 ];

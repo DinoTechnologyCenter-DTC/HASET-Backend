@@ -67,7 +67,7 @@ class PaymentController extends Controller
             );
 
             if ($paymentResult['success']) {
-                // Update transaction with SonicPesa reference
+                // Update transaction with SonicPesa order_id (this is what we need for status checks)
                 $transaction->update([
                     'external_reference' => $paymentResult['data']['id'] ?? $orderReference,
                     'status' => 'processing'
@@ -195,19 +195,52 @@ class PaymentController extends Controller
         // Check status with SonicPesa
         try {
             $sonicPesa = new \App\Services\SonicPesaService();
-            // Use external reference (transaction ID from SonicPesa) if available, otherwise fallback might fail
-            // SonicPesa usually needs the ID they returned. Transaction model stores it in external_reference.
+            
+            // If no external reference, we can't check with SonicPesa
+            if (empty($transaction->external_reference)) {
+                Log::warning('No external_reference for transaction', [
+                    'transaction_id' => $transaction->id,
+                    'external_reference' => $transaction->external_reference
+                ]);
+                return response()->json([
+                    'status' => 'success',
+                    'transaction' => [
+                        'id' => $transaction->id,
+                        'status' => $transaction->status,
+                        'amount' => $transaction->amount,
+                        'currency' => $transaction->currency,
+                        'provider' => $transaction->provider,
+                        'warning' => 'No external reference - cannot check with payment provider'
+                    ]
+                ], 200);
+            }
+            
+            Log::info('Checking payment status', [
+                'transaction_id' => $transaction->id,
+                'external_reference' => $transaction->external_reference,
+                'current_status' => $transaction->status
+            ]);
+            
+            // Use external reference (transaction ID from SonicPesa) if available
             $result = $sonicPesa->checkPaymentStatus($transaction->external_reference);
+            
+            Log::info('SonicPesa status check result', [
+                'transaction_id' => $transaction->id,
+                'result' => $result
+            ]);
             
             if ($result['success'] && isset($result['data']['status'])) {
                 // Update transaction status
-                $sonicPesaStatus = $result['data']['status']; // ALREADY MAPPED TO UPPERCASE OR STANDARD IN SERVICE
+                $sonicPesaStatus = $result['data']['status']; // COMPLETED, PENDING, CANCELLED
                 
-                // Map again just to be safe if service returns RAW status or standard one
-                $newStatus = match(strtoupper($sonicPesaStatus)) {
-                    'SUCCESS', 'COMPLETED' => 'success',
-                    'FAILED', 'CANCELLED' => 'failed',
-                    'PROCESSING', 'PENDING' => 'pending',
+                // Map SonicPesa status values to local status
+                // COMPLETED -> success
+                // PENDING, INPROGRESS -> pending  
+                // CANCELLED, USERCANCELLED, REJECTED -> failed
+                $newStatus = match($sonicPesaStatus) {
+                    'COMPLETED' => 'success',
+                    'PENDING', 'INPROGRESS' => 'pending',
+                    'CANCELLED', 'USERCANCELLED', 'REJECTED' => 'failed',
                     default => 'pending'
                 };
                 
@@ -267,5 +300,113 @@ class PaymentController extends Controller
         }
 
         return response()->json(['status' => 'error', 'message' => 'Transaction cannot be cancelled or already finished'], 400);
+    }
+
+    public function payout(Request $request)
+    {
+        // 1. Validate Input
+        $validated = $request->validate([
+            'request_id' => 'required|string',
+            'doctor_id' => 'required|string',
+            'amount' => 'required|numeric',
+            'phone_number' => 'required|string',
+            'provider' => 'required|string',
+            'admin_id' => 'required|string',
+            'password' => 'required|string',
+        ]);
+
+        // 2. Simple Password Verification (Admin context)
+        $adminPassword = config('services.admin.payout_password', 'admin123'); // Default for safety
+        if ($validated['password'] !== $adminPassword) {
+            Log::warning('Unauthorized payout attempt: Invalid admin password', [
+                'admin_id' => $validated['admin_id'],
+                'request_id' => $validated['request_id']
+            ]);
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Unauthorized: Invalid admin password'
+            ], 401);
+        }
+
+        Log::info('Admin Withdrawal Approved, initiating payout', [
+            'admin_id' => $validated['admin_id'],
+            'doctor_id' => $validated['doctor_id'],
+            'amount' => $validated['amount']
+        ]);
+
+        // 3. Create transaction record for audit
+        $transaction = Transaction::create([
+            'user_id' => $validated['admin_id'], // Admin who authorized
+            'doctor_id' => $validated['doctor_id'],
+            'amount' => $validated['amount'],
+            'currency' => 'TZS',
+            'provider' => $validated['provider'],
+            'payment_account' => $validated['phone_number'],
+            'status' => 'pending',
+            'description' => 'Doctor Withdrawal (Manual Approval)',
+        ]);
+
+        try {
+            $sonicPesa = new \App\Services\SonicPesaService();
+            
+            // Logic to disburse money via SonicPesa
+            $payoutResult = $sonicPesa->payout(
+                $validated['phone_number'],
+                $validated['amount'],
+                $validated['request_id']
+            );
+
+            if ($payoutResult['success']) {
+                $transaction->update(['status' => 'success']);
+                
+                return response()->json([
+                    'status' => 'success',
+                    'message' => 'Funds successfully disbursed to ' . $validated['phone_number'],
+                    'transaction_id' => $transaction->id
+                ], 200);
+            } else {
+                $transaction->update(['status' => 'failed']);
+                
+                return response()->json([
+                    'status' => 'error',
+                    'message' => $payoutResult['error'] ?? 'Payout failed at gateway',
+                    'transaction_id' => $transaction->id
+                ], 400);
+            }
+        } catch (\Exception $e) {
+            $transaction->update(['status' => 'failed']);
+            Log::error('Payout exception: ' . $e->getMessage());
+            
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Internal error during payout: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    public function getBalance()
+    {
+        try {
+            $sonicPesa = new \App\Services\SonicPesaService();
+            $result = $sonicPesa->getAccountBalance();
+
+            if ($result['success']) {
+                return response()->json([
+                    'status' => 'success',
+                    'data' => $result['data']
+                ], 200);
+            }
+
+            return response()->json([
+                'status' => 'error',
+                'message' => $result['error'] ?? 'Failed to fetch balance'
+            ], 400);
+        } catch (\Exception $e) {
+            Log::error('Balance check exception: ' . $e->getMessage());
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Internal error checking balance'
+            ], 500);
+        }
     }
 }

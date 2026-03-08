@@ -1,9 +1,26 @@
 # HASET Payment Backend API Documentation
 
 ## Overview
-This Laravel backend service handles payment processing for the HASET mobile application. It provides endpoints for initiating payments and receiving payment gateway callbacks.
+This Laravel backend service handles payment processing for the HASET mobile application using the **SonicPesa** payment gateway. It provides endpoints for initiating USSD push payments, checking payment status, and handling callbacks.
 
-**Base URL (Development):** `http://127.0.0.1:8001/api`
+**Base URL:** `https://hasethospital.or.tz/api/` (Production)
+**Base URL:** `https://your-ngrok-url.ngrok-free.dev/api/` (Development)
+
+---
+
+## Payment Flow
+
+```
+┌─────────┐     POST /initiate      ┌─────────┐     USSD Push      ┌─────────┐
+│  App    │ ──────────────────────► │ Backend │ ────────────────► │ Sonic   │
+│         │ ◄────────────────────── │         │ ◄─────────────── │ Pesa    │
+└─────────┘                         └─────────┘                   └─────────┘
+      │                                   │                              │
+      │      GET /status (every 6s)      │                              │
+      │ ─────────────────────────────────►│                              │
+      │ ◄─────────────────────────────────│                              │
+      │         (polls until success)     │                              │
+```
 
 ---
 
@@ -13,7 +30,7 @@ This Laravel backend service handles payment processing for the HASET mobile app
 
 **Endpoint:** `POST /payment/initiate`
 
-**Description:** Creates a payment transaction record and initiates payment processing.
+Initiates a USSD push payment to the customer's phone.
 
 **Headers:**
 ```
@@ -28,44 +45,52 @@ Accept: application/json
   "doctor_id": "doc_123",
   "amount": 10000,
   "provider": "Mpesa",
-  "payment_account": "+255712345678"
+  "payment_account": "255712345678"
 }
 ```
 
-**Request Parameters:**
-
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `user_id` | string | No | Firebase UID of the patient making payment |
-| `doctor_id` | string | Yes | Firebase UID or ID of the doctor receiving payment |
-| `amount` | number | Yes | Payment amount in TZS (minimum: 1) |
-| `provider` | string | Yes | Payment provider (e.g., "Mpesa", "Airtel Money", "CRDB", "NMB") |
-| `payment_account` | string | Yes | Mobile number (for mobile money) or account number (for bank) |
+| `user_id` | string | No | Firebase UID of the patient |
+| `doctor_id` | string | Yes | Doctor's Firebase UID |
+| `amount` | number | Yes | Amount in TZS (min: 50, max: 5,000,000) |
+| `provider` | string | Yes | Provider name (Mpesa, TigoPesa, AirtelMoney, HaloPesa) |
+| `payment_account` | string | Yes | Mobile number (255XXXXXXXXX format) |
 
 **Success Response (200 OK):**
 ```json
 {
   "status": "success",
-  "message": "Payment initiated successfully",
+  "message": "Payment initiated successfully. Please check your phone to complete the payment.",
+  "transaction_id": 1,
+  "order_reference": "HASET66T1234567890",
+  "sonicpesa_status": "PENDING",
+  "payment_channel": "M-Pesa"
+}
+```
+
+**Error Response - Duplicate Request (429):**
+```json
+{
+  "status": "error",
+  "message": "A payment request is already active for this doctor. Please wait for the USSD prompt on your phone.",
   "transaction_id": 1
 }
 ```
 
-**Error Response (422 Unprocessable Entity):**
+**Error Response - Validation (422):**
 ```json
 {
   "message": "The amount field is required.",
   "errors": {
-    "amount": [
-      "The amount field is required."
-    ]
+    "amount": ["The amount field is required."]
   }
 }
 ```
 
 **Example cURL:**
 ```bash
-curl -X POST http://127.0.0.1:8001/api/payment/initiate \
+curl -X POST https://hasethospital.or.tz/api/payment/initiate \
   -H "Content-Type: application/json" \
   -H "Accept: application/json" \
   -d '{
@@ -73,29 +98,176 @@ curl -X POST http://127.0.0.1:8001/api/payment/initiate \
     "doctor_id": "doc_456",
     "amount": 15000,
     "provider": "Mpesa",
-    "payment_account": "+255712345678"
+    "payment_account": "255712345678"
   }'
 ```
 
 ---
 
-### 2. Payment Callback (Webhook)
+### 2. Check Payment Status
+
+**Endpoint:** `GET /payment/status?transaction_id={id}`
+
+Poll this endpoint to check if payment has been completed. The Android app polls every 6 seconds (max 20 attempts = 2 minutes).
+
+**Query Parameters:**
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `transaction_id` | integer | Yes | Transaction ID from initiate response |
+
+**Success Response (200 OK):**
+```json
+{
+  "status": "success",
+  "transaction": {
+    "id": 1,
+    "status": "pending",
+    "amount": 15000,
+    "currency": "TZS",
+    "provider": "Mpesa",
+    "created_at": "2026-02-23T12:00:00Z",
+    "updated_at": "2026-02-23T12:00:05Z"
+  }
+}
+```
+
+**Status Values (from SonicPesa):**
+| Status | Description |
+|--------|-------------|
+| `PENDING` | Payment initiated, waiting for user to complete USSD on phone |
+| `INPROGRESS` | Payment is being processed |
+| `COMPLETED` | Payment completed successfully |
+| `CANCELLED` | Payment was cancelled |
+| `USERCANCELLED` | User cancelled the payment on their phone |
+| `REJECTED` | Payment was rejected |
+
+**Local Status Mapping:**
+| SonicPesa Status | Local Status |
+|------------------|---------------|
+| COMPLETED | success |
+| PENDING, INPROGRESS | pending |
+| CANCELLED, USERCANCELLED, REJECTED | failed |
+
+---
+
+### 3. Payment Callback (Webhook)
 
 **Endpoint:** `POST /payment/callback`
 
-**Description:** Receives webhook notifications from payment gateways about transaction status updates.
+Receives webhook notifications from SonicPesa when payment status changes. This is the most reliable way to receive payment confirmation.
 
 **Headers:**
 ```
 Content-Type: application/json
+X-SonicPesa-Signature: <signature_for_verification>
 ```
 
-**Request Body:** (Varies by payment gateway)
+**Request Body (from SonicPesa):**
+```json
+{
+  "event": "payment.completed",
+  "order_id": "sp_67890abcdef",
+  "amount": 10000,
+  "currency": "TZS",
+  "status": "SUCCESS",
+  "transid": "TXN123456",
+  "channel": "AIRTELMONEY",
+  "reference": "0289999288",
+  "msisdn": "255682812345",
+  "timestamp": "2025-01-07T12:05:00Z"
+}
+```
 
 **Success Response (200 OK):**
 ```json
 {
   "status": "received"
+}
+```
+
+---
+
+### 4. Withdraw Funds (Payout)
+
+**Endpoint:** `POST /payment/payout`
+
+Initiates a fund disbursement (payout) to a doctor's mobile money account. This is usually triggered by an admin approval.
+
+**Headers:**
+```
+Content-Type: application/json
+Accept: application/json
+```
+
+**Request Body:**
+```json
+{
+  "request_id": "withdraw_123",
+  "doctor_id": "doc_456",
+  "amount": 50000,
+  "phone_number": "255712345678",
+  "provider": "Mpesa",
+  "admin_id": "admin_uid_789",
+  "password": "YOUR_ADMIN_PASSWORD"
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `request_id` | string | Yes | The ID of the withdrawal request |
+| `doctor_id` | string | Yes | Doctor's Firebase UID |
+| `amount` | number | Yes | Amount to disburse |
+| `phone_number` | string | Yes | Recipient's mobile number (255XXXXXXXXX format) |
+| `provider` | string | Yes | Provider name (Mpesa, TigoPesa, etc.) |
+| `admin_id` | string | Yes | Firebase UID of the admin performing the action |
+| `password` | string | Yes | Admin payout password for verification |
+
+**Success Response (200 OK):**
+```json
+{
+  "status": "success",
+  "message": "Payout initiated successfully",
+  "transaction_id": 45,
+  "sonicpesa_response": { ... }
+}
+```
+
+**Error Response - Invalid Password (403):**
+```json
+{
+  "status": "error",
+  "message": "Invalid admin password"
+}
+```
+
+---
+
+### 5. Cancel Payment
+
+**Endpoint:** `POST /payment/cancel`
+
+Cancels an active payment transaction (when user aborts).
+
+**Request Body:**
+```json
+{
+  "transaction_id": 1
+}
+```
+
+**Success Response (200 OK):**
+```json
+{
+  "status": "success",
+  "message": "Transaction cancelled"
+}
+```
+
+**Error Response (400):**
+```json
+{
+  "status": "error",
+  "message": "Transaction cannot be cancelled or already finished"
 }
 ```
 
@@ -109,289 +281,164 @@ Content-Type: application/json
 |--------|------|-------------|
 | `id` | bigint | Primary key |
 | `user_id` | string (nullable) | Firebase UID of the patient |
-| `doctor_id` | string (nullable) | Firebase UID of the doctor |
-| `amount` | decimal(12,2) | Payment amount |
+| `doctor_id` | string | Firebase UID of the doctor |
+| `amount` | decimal(12,2) | Payment amount in TZS |
 | `currency` | string | Currency code (default: "TZS") |
-| `provider` | string (nullable) | Payment provider name |
-| `payment_account` | string (nullable) | Phone number or account number |
-| `status` | string | Transaction status: "pending", "success", "failed" |
-| `external_reference` | string (nullable) | Payment gateway transaction ID |
-| `description` | string (nullable) | Transaction description |
+| `provider` | string | Payment provider name |
+| `payment_account` | string | Phone number used for payment |
+| `status` | string | pending/processing/success/failed |
+| `external_reference` | string | SonicPesa order_id |
+| `description` | string | Transaction description |
 | `created_at` | timestamp | Record creation time |
 | `updated_at` | timestamp | Last update time |
 
 ---
 
-## Android Integration
+## Environment Configuration
 
-### Step 1: Add Retrofit Dependencies
+Create/update `.env` file:
 
-Add to your `build.gradle` (app level):
-
-```gradle
-dependencies {
-    implementation 'com.squareup.retrofit2:retrofit:2.9.0'
-    implementation 'com.squareup.retrofit2:converter-gson:2.9.0'
-    implementation 'com.squareup.okhttp3:logging-interceptor:4.11.0'
-}
+```env
+# SonicPesa Payment Gateway
+SONICPESA_ENABLED=true
+SONICPESA_API_KEY=sk_live_xxxxxxxxxxxxxxxxxxxx
+SONICPESA_SECRET=xxxxxxxxxxxxxxxxxxxx
+SONICPESA_BASE_URL=https://api.sonicpesa.com/api/v1
 ```
 
-### Step 2: Create API Interface
+**Configuration Details:**
 
-Create `PaymentApiService.java`:
+| Variable | Description |
+|----------|-------------|
+| `SONICPESA_ENABLED` | Set to `false` for simulation mode (always returns success) |
+| `SONICPESA_API_KEY` | Your SonicPesa API key (get from dashboard) |
+| `SONICPESA_SECRET` | Your SonicPesa secret key |
+| `SONICPESA_BASE_URL` | API base URL (default: https://api.sonicpesa.com/api/v1) |
+
+---
+
+## Android Integration
+
+### API Service Interface
 
 ```java
 package com.haset.hasetapp.api;
 
-import com.haset.hasetapp.models.PaymentRequest;
-import com.haset.hasetapp.models.PaymentResponse;
+import com.haset.hasetapp.api.requests.PaymentRequest;
+import com.haset.hasetapp.api.responses.PaymentResponse;
+import com.haset.hasetapp.api.responses.PaymentStatusResponse;
 
 import retrofit2.Call;
 import retrofit2.http.Body;
+import retrofit2.http.GET;
 import retrofit2.http.POST;
+import retrofit2.http.Query;
 
 public interface PaymentApiService {
     @POST("payment/initiate")
     Call<PaymentResponse> initiatePayment(@Body PaymentRequest request);
+
+    @GET("payment/status")
+    Call<PaymentStatusResponse> checkPaymentStatus(@Query("transaction_id") int transactionId);
+
+    @POST("payment/cancel")
+    Call<Void> cancelPayment(@Query("transaction_id") int transactionId);
 }
 ```
 
-### Step 3: Create Data Models
+### Request/Response Models
 
-Create `PaymentRequest.java`:
-
+**PaymentRequest.java:**
 ```java
-package com.haset.hasetapp.models;
-
 public class PaymentRequest {
     private String user_id;
     private String doctor_id;
     private double amount;
     private String provider;
     private String payment_account;
-
-    public PaymentRequest(String userId, String doctorId, double amount, 
-                         String provider, String paymentAccount) {
-        this.user_id = userId;
-        this.doctor_id = doctorId;
-        this.amount = amount;
-        this.provider = provider;
-        this.payment_account = paymentAccount;
-    }
-
-    // Getters and setters
+    // Constructors, getters, setters
 }
 ```
 
-Create `PaymentResponse.java`:
-
+**PaymentResponse.java:**
 ```java
-package com.haset.hasetapp.models;
-
 public class PaymentResponse {
     private String status;
     private String message;
     private int transaction_id;
-
-    // Getters and setters
-    public String getStatus() { return status; }
-    public String getMessage() { return message; }
-    public int getTransactionId() { return transaction_id; }
+    private String order_reference;
+    private String sonicpesa_status;
+    // Getters
 }
 ```
 
-### Step 4: Create Retrofit Client
-
-Create `RetrofitClient.java`:
-
+**PaymentStatusResponse.java:**
 ```java
-package com.haset.hasetapp.api;
+public class PaymentStatusResponse {
+    private String status;
+    private Transaction transaction;
 
-import okhttp3.OkHttpClient;
-import okhttp3.logging.HttpLoggingInterceptor;
-import retrofit2.Retrofit;
-import retrofit2.converter.gson.GsonConverterFactory;
+    public class Transaction {
+        private int id;
+        private String status;  // pending, processing, success, failed
+        private double amount;
+        private String currency;
+        private String provider;
 
-public class RetrofitClient {
-    private static final String BASE_URL = "http://10.0.2.2:8001/api/"; // For emulator
-    // Use "http://YOUR_LOCAL_IP:8001/api/" for physical device
-    
-    private static Retrofit retrofit = null;
-
-    public static Retrofit getClient() {
-        if (retrofit == null) {
-            HttpLoggingInterceptor interceptor = new HttpLoggingInterceptor();
-            interceptor.setLevel(HttpLoggingInterceptor.Level.BODY);
-            
-            OkHttpClient client = new OkHttpClient.Builder()
-                    .addInterceptor(interceptor)
-                    .build();
-
-            retrofit = new Retrofit.Builder()
-                    .baseUrl(BASE_URL)
-                    .client(client)
-                    .addConverterFactory(GsonConverterFactory.create())
-                    .build();
-        }
-        return retrofit;
+        public boolean isSuccess() { return "success".equals(status); }
+        public boolean isFailed() { return "failed".equals(status); }
+        public boolean isProcessing() { return "pending".equals(status) || "processing".equals(status); }
     }
 }
 ```
 
-### Step 5: Update PaymentRepository
-
-Modify `PaymentRepository.java`:
+### Payment Repository (Polling Logic)
 
 ```java
-package com.haset.hasetapp.repositories;
-
-import android.util.Log;
-
-import com.haset.hasetapp.api.PaymentApiService;
-import com.haset.hasetapp.api.RetrofitClient;
-import com.haset.hasetapp.models.PaymentRequest;
-import com.haset.hasetapp.models.PaymentResponse;
-import com.haset.hasetapp.utils.FirebaseHelper;
-
-import retrofit2.Call;
-import retrofit2.Callback;
-import retrofit2.Response;
-
 public class PaymentRepository {
-    private static final String TAG = "PaymentRepository";
-    private PaymentApiService apiService;
+    private static final int STATUS_CHECK_INTERVAL = 6000; // 6 seconds
+    private static final int MAX_STATUS_CHECKS = 20; // 2 minutes total
 
-    public PaymentRepository() {
-        apiService = RetrofitClient.getClient().create(PaymentApiService.class);
-    }
-
-    public void processPayment(String userId, String doctorId, double amount, 
-                              String provider, String paymentAccount,
-                              FirebaseHelper.OnCompleteListener<Boolean> callback) {
-        
-        PaymentRequest request = new PaymentRequest(userId, doctorId, amount, 
-                                                    provider, paymentAccount);
-        
-        Call<PaymentResponse> call = apiService.initiatePayment(request);
-        
-        call.enqueue(new Callback<PaymentResponse>() {
-            @Override
-            public void onResponse(Call<PaymentResponse> call, Response<PaymentResponse> response) {
-                if (response.isSuccessful() && response.body() != null) {
-                    PaymentResponse paymentResponse = response.body();
-                    Log.d(TAG, "Payment initiated: " + paymentResponse.getMessage());
-                    Log.d(TAG, "Transaction ID: " + paymentResponse.getTransactionId());
-                    
-                    // Also update Firebase wallet
-                    FirebaseHelper.addToDoctorWallet(doctorId, amount, callback);
-                } else {
-                    Log.e(TAG, "Payment failed: " + response.code());
-                    callback.onComplete(false, new Exception("Payment initiation failed"));
-                }
-            }
-
-            @Override
-            public void onFailure(Call<PaymentResponse> call, Throwable t) {
-                Log.e(TAG, "Network error: " + t.getMessage());
-                callback.onComplete(false, new Exception(t.getMessage()));
-            }
-        });
-    }
-    
-    // Keep the old method for backward compatibility
-    public void addToDoctorWallet(String doctorId, double amount, 
-                                 FirebaseHelper.OnCompleteListener<Boolean> callback) {
-        FirebaseHelper.addToDoctorWallet(doctorId, amount, callback);
-    }
-}
-```
-
-### Step 6: Update PaymentActivity
-
-In your `processPayment()` method in `PaymentActivity.java`, update the call:
-
-```java
-private void processPayment() {
-    // ... existing code ...
-    
-    handler.postDelayed(() -> {
-        progressIndicator.setProgress(100, true);
-        
-        if (doctor != null) {
-            String doctorId = doctor.getDoctorId() != null ? 
-                            doctor.getDoctorId() : doctor.getUserId();
-            String userId = getCurrentUserId(); // Get from Firebase Auth
-            
-            if (doctorId != null) {
-                // Call the new method with payment details
-                viewModel.processPayment(userId, doctorId, consultationFee, 
-                                       paymentProvider, walletNumber);
-            } else {
-                Toast.makeText(this, "Error: Doctor ID missing", 
-                             Toast.LENGTH_SHORT).show();
-                // ... error handling ...
-            }
+    private void pollPaymentStatus(int transactionId, String doctorId, double amount,
+                                  int attemptCount, OnCompleteListener<Boolean> callback) {
+        if (attemptCount >= MAX_STATUS_CHECKS) {
+            isProcessingPayment = false;
+            callback.onError("Payment verification timed out.");
+            return;
         }
-    }, 2000);
-}
 
-private String getCurrentUserId() {
-    return com.google.firebase.auth.FirebaseAuth.getInstance()
-           .getCurrentUser() != null ? 
-           com.google.firebase.auth.FirebaseAuth.getInstance()
-           .getCurrentUser().getUid() : null;
-}
-```
-
-### Step 7: Update PaymentViewModel
-
-Update `PaymentViewModel.java`:
-
-```java
-public void processPayment(String userId, String doctorId, double amount,
-                          String provider, String paymentAccount) {
-    processing.setValue(true);
-    
-    repository.processPayment(userId, doctorId, amount, provider, paymentAccount,
-        new FirebaseHelper.OnCompleteListener<Boolean>() {
-            @Override
-            public void onComplete(Boolean result, Exception exception) {
-                processing.setValue(false);
-                if (exception == null && result) {
-                    success.setValue(true);
-                } else {
-                    error.setValue(exception != null ? 
-                                 exception.getMessage() : "Payment failed");
+        statusCheckHandler.postDelayed(() -> {
+            checkPaymentStatus(transactionId, new OnCompleteListener<PaymentStatusResponse>() {
+                @Override
+                public void onSuccess(PaymentStatusResponse result) {
+                    if (result.getTransaction().isSuccess()) {
+                        // Update Firebase wallet
+                        FirebaseHelper.addToDoctorWallet(doctorId, amount, callback);
+                    } else if (result.getTransaction().isFailed()) {
+                        isProcessingPayment = false;
+                        callback.onError("Payment was unsuccessful.");
+                    } else {
+                        // Continue polling
+                        pollPaymentStatus(transactionId, doctorId, amount, attemptCount + 1, callback);
+                    }
                 }
-            }
-        });
+
+                @Override
+                public void onError(String error) {
+                    // Continue polling on error
+                    pollPaymentStatus(transactionId, doctorId, amount, attemptCount + 1, callback);
+                }
+            });
+        }, STATUS_CHECK_INTERVAL);
+    }
 }
 ```
-
-### Step 8: Add Internet Permission
-
-In `AndroidManifest.xml`:
-
-```xml
-<uses-permission android:name="android.permission.INTERNET" />
-```
-
-### Step 9: Allow Cleartext Traffic (Development Only)
-
-In `AndroidManifest.xml`, add to `<application>` tag:
-
-```xml
-android:usesCleartextTraffic="true"
-```
-
-**⚠️ Important:** Remove this in production and use HTTPS!
 
 ---
 
 ## Testing
 
-### Test Payment Initiation
-
+### Test Payment Initiation (Local)
 ```bash
 curl -X POST http://127.0.0.1:8001/api/payment/initiate \
   -H "Content-Type: application/json" \
@@ -401,57 +448,73 @@ curl -X POST http://127.0.0.1:8001/api/payment/initiate \
     "doctor_id": "test_doc_456",
     "amount": 25000,
     "provider": "Mpesa",
-    "payment_account": "+255712345678"
+    "payment_account": "255712345678"
   }'
 ```
 
-### View All Transactions
-
+### Test Payment Status
 ```bash
-php artisan tinker --execute="echo json_encode(App\Models\Transaction::all()->toArray(), JSON_PRETTY_PRINT);"
+curl "http://127.0.0.1:8001/api/payment/status?transaction_id=1"
+```
+
+### View All Transactions
+```bash
+php artisan tinker --execute="echo App\Models\Transaction::all()->toJson(JSON_PRETTY_PRINT);"
+```
+
+### View Recent Logs
+```bash
+tail -f storage/logs/laravel.log | grep -i sonicpesa
 ```
 
 ---
 
-## Next Steps (Production Readiness)
+## Error Codes
 
-1. **Payment Gateway Integration:**
-   - Integrate with actual payment providers (Selcom, AzamPay, Chapa, etc.)
-   - Implement proper webhook handling
-   - Add transaction verification
-
-2. **Security:**
-   - Add API authentication (Laravel Sanctum tokens)
-   - Implement rate limiting
-   - Add request signing/verification
-   - Use HTTPS in production
-
-3. **Database:**
-   - Switch from SQLite to MySQL/PostgreSQL
-   - Add database indexes for performance
-   - Implement transaction logging
-
-4. **Error Handling:**
-   - Add comprehensive error responses
-   - Implement retry mechanisms
-   - Add transaction rollback logic
-
-5. **Monitoring:**
-   - Add logging (Laravel Log)
-   - Implement transaction status tracking
-   - Set up alerts for failed payments
-
-6. **Deployment:**
-   - Deploy to production server
-   - Configure environment variables
-   - Set up SSL certificate
-   - Configure CORS for mobile app
+| HTTP Code | Description |
+|-----------|-------------|
+| 200 | Success |
+| 400 | Bad Request |
+| 404 | Transaction not found |
+| 422 | Validation Error |
+| 429 | Too Many Requests (duplicate payment) |
+| 500 | Internal Server Error |
 
 ---
 
-## Support
+## Security Notes
 
-For issues or questions, contact the development team.
+1. **API Authentication**: In production, implement Laravel Sanctum token authentication
+2. **HTTPS Only**: Always use HTTPS in production
+3. **Webhook Verification**: Verify SonicPesa signature using X-SonicPesa-Signature header
+4. **Rate Limiting**: Configure API rate limiting in `.env`
+5. **Input Validation**: All inputs are validated server-side
 
-**Version:** 1.0.0  
-**Last Updated:** 2026-01-23
+---
+
+## Troubleshooting
+
+### USSD Not Showing on Phone
+- Verify phone number format is correct (255XXXXXXXXX, no + or leading 0)
+- Check SONICPESA credentials in `.env`
+- Check Laravel logs for SonicPesa API errors
+
+### Status Stuck on "pending"
+- Check if webhook is configured in SonicPesa dashboard
+- Verify `external_reference` is being saved in database
+- Check network connectivity to SonicPesa API
+
+### Too Many Requests
+- This is intentional - 2-minute de-bounce prevents duplicate USSD prompts
+- Wait for existing transaction to complete or cancel it
+
+---
+
+## Version History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| 1.0.0 | 2026-01-23 | Initial documentation |
+| 1.1.0 | 2026-02-23 | Added SonicPesa v1 API integration, status check endpoint |
+
+**Last Updated:** 2026-02-23

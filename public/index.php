@@ -5,6 +5,10 @@ use Illuminate\Http\Request;
 
 define('LARAVEL_START', microtime(true));
 
+// Increase execution time for payment processing (35 seconds - matches Guzzle timeout)
+ini_set('max_execution_time', 35);
+ini_set('default_socket_timeout', 35);
+
 // Determine if the application is in maintenance mode...
 if (file_exists($maintenance = __DIR__.'/../storage/framework/maintenance.php')) {
     require $maintenance;
