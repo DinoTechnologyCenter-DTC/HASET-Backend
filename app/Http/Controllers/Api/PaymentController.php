@@ -52,22 +52,22 @@ class PaymentController extends Controller
             'description' => 'Consultation Fee Payment',
         ]);
 
-        // 3. Integrate with SonicPesa Payment Gateway
+        // 3. Integrate with Zeno Payment Gateway
         try {
-            $sonicPesa = new \App\Services\SonicPesaService();
+            $zeno = new \App\Services\ZenoPaymentService();
             
             // Generate unique order reference
             $orderReference = 'HASET' . $transaction->id . 'T' . time();
             
-            // Initiate payment with SonicPesa
-            $paymentResult = $sonicPesa->initiatePayment(
+            // Initiate payment with Zeno
+            $paymentResult = $zeno->initiatePayment(
                 $validated['payment_account'],
                 $validated['amount'],
                 $orderReference
             );
 
             if ($paymentResult['success']) {
-                // Update transaction with SonicPesa order_id (this is what we need for status checks)
+                // Update transaction with Zeno transaction_id (this is what we need for status checks)
                 $transaction->update([
                     'external_reference' => $paymentResult['data']['id'] ?? $orderReference,
                     'status' => 'processing'
@@ -75,7 +75,7 @@ class PaymentController extends Controller
 
                 Log::info('Payment initiated successfully', [
                     'transaction_id' => $transaction->id,
-                    'sonicpesa_id' => $paymentResult['data']['id'] ?? null,
+                    'zeno_id' => $paymentResult['data']['id'] ?? null,
                     'order_reference' => $orderReference
                 ]);
 
@@ -84,14 +84,14 @@ class PaymentController extends Controller
                     'message' => 'Payment initiated successfully. Please check your phone to complete the payment.',
                     'transaction_id' => $transaction->id,
                     'order_reference' => $orderReference,
-                    'sonicpesa_status' => $paymentResult['data']['status'] ?? 'pending',
+                    'zeno_status' => $paymentResult['data']['status'] ?? 'pending',
                     'payment_channel' => $paymentResult['data']['channel'] ?? $validated['provider']
                 ], 200);
             } else {
                 // Payment initiation failed
                 $transaction->update(['status' => 'failed']);
                 
-                Log::error('SonicPesa payment initiation failed', [
+                Log::error('Zeno payment initiation failed', [
                     'transaction_id' => $transaction->id,
                     'error' => $paymentResult['error'] ?? 'Unknown error'
                 ]);
@@ -121,11 +121,11 @@ class PaymentController extends Controller
     
     public function callback(Request $request)
     {
-        // Handle webhook callbacks from SonicPesa
-        Log::info('SonicPesa Payment Callback Received:', $request->all());
+        // Handle webhook callbacks from Zeno
+        Log::info('Zeno Payment Callback Received:', $request->all());
         
         try {
-            // SonicPesa typically sends transaction_id and payment_status
+            // Zeno typically sends transaction_id and payment_status
             $transactionId = $request->input('transaction_id'); // External ID
             $status = strtolower($request->input('payment_status')); // success, failed
             
@@ -192,11 +192,11 @@ class PaymentController extends Controller
             ], 200);
         }
         
-        // Check status with SonicPesa
+        // Check status with Zeno
         try {
-            $sonicPesa = new \App\Services\SonicPesaService();
+            $zeno = new \App\Services\ZenoPaymentService();
             
-            // If no external reference, we can't check with SonicPesa
+            // If no external reference, we can't check with Zeno
             if (empty($transaction->external_reference)) {
                 Log::warning('No external_reference for transaction', [
                     'transaction_id' => $transaction->id,
@@ -221,26 +221,26 @@ class PaymentController extends Controller
                 'current_status' => $transaction->status
             ]);
             
-            // Use external reference (transaction ID from SonicPesa) if available
-            $result = $sonicPesa->checkPaymentStatus($transaction->external_reference);
+            // Use external reference (transaction ID from Zeno) if available
+            $result = $zeno->checkPaymentStatus($transaction->external_reference);
             
-            Log::info('SonicPesa status check result', [
+            Log::info('Zeno status check result', [
                 'transaction_id' => $transaction->id,
                 'result' => $result
             ]);
             
             if ($result['success'] && isset($result['data']['status'])) {
                 // Update transaction status
-                $sonicPesaStatus = $result['data']['status']; // COMPLETED, PENDING, CANCELLED
+                $zenoStatus = $result['data']['status']; // COMPLETED, PENDING, CANCELLED
                 
-                // Map SonicPesa status values to local status
+                // Map Zeno status values to local status
                 // COMPLETED -> success
-                // PENDING, INPROGRESS -> pending  
-                // CANCELLED, USERCANCELLED, REJECTED -> failed
-                $newStatus = match($sonicPesaStatus) {
+                // PENDING -> pending  
+                // CANCELLED, REJECTED -> failed
+                $newStatus = match($zenoStatus) {
                     'COMPLETED' => 'success',
-                    'PENDING', 'INPROGRESS' => 'pending',
-                    'CANCELLED', 'USERCANCELLED', 'REJECTED' => 'failed',
+                    'PENDING' => 'pending',
+                    'CANCELLED', 'REJECTED' => 'failed',
                     default => 'pending'
                 };
                 
@@ -251,7 +251,7 @@ class PaymentController extends Controller
                     'transaction' => [
                         'id' => $transaction->id,
                         'status' => $newStatus,
-                        'sonicpesa_status' => $sonicPesaStatus,
+                        'zeno_status' => $zenoStatus,
                         'amount' => $transaction->amount,
                         'currency' => $transaction->currency,
                         'provider' => $transaction->provider,
@@ -347,10 +347,10 @@ class PaymentController extends Controller
         ]);
 
         try {
-            $sonicPesa = new \App\Services\SonicPesaService();
+            $zeno = new \App\Services\ZenoPaymentService();
             
-            // Logic to disburse money via SonicPesa
-            $payoutResult = $sonicPesa->payout(
+            // Logic to disburse money via Zeno
+            $payoutResult = $zeno->payout(
                 $validated['phone_number'],
                 $validated['amount'],
                 $validated['request_id']
@@ -387,8 +387,8 @@ class PaymentController extends Controller
     public function getBalance()
     {
         try {
-            $sonicPesa = new \App\Services\SonicPesaService();
-            $result = $sonicPesa->getAccountBalance();
+            $zeno = new \App\Services\ZenoPaymentService();
+            $result = $zeno->getAccountBalance();
 
             if ($result['success']) {
                 return response()->json([

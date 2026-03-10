@@ -35,12 +35,10 @@ return [
         ],
     ],
 
-    'sonicpesa' => [
-        'enabled' => env('SONICPESA_ENABLED', true),
-        'email' => env('SONICPESA_EMAIL'),
-        'api_key' => env('SONICPESA_API_KEY'),
-        'secret' => env('SONICPESA_SECRET'),
-        'base_url' => env('SONICPESA_BASE_URL', 'https://api.sonicpesa.com/api/v1'),
+    'zeno' => [
+        'enabled' => env('ZENO_ENABLED', true),
+        'api_key' => env('ZENO_API_KEY'),
+        'base_url' => env('ZENO_BASE_URL', 'https://api.zeno.africa/v1'),
     ],
 
     'admin' => [
